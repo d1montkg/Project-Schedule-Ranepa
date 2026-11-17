@@ -42,6 +42,10 @@ class GoogleAuthError(Exception):
     pass
 
 
+class BadCredentials(Exception):
+    pass
+
+
 def run_sync(login, password, calendar_id):
     now = dt.datetime.now(tz=moscow_tz)
     start, end = get_window(now)
@@ -50,14 +54,20 @@ def run_sync(login, password, calendar_id):
         schedule = get_schedule(start, end, login, password)
         service = get_calendar_service()
         exist_events = read_events(service, calendar_id, start, end)
-    except (ScheduleError, NetworkError,
-            GoogleAuthError, GoogleHttpError) as e:
-        return f"Синхронизация не выполнена: {e}"
+    except (BadCredentials, GoogleAuthError) as e:
+        return "user_error", f"Синхронизация не выполнена: {e}"
+    except (ScheduleError, NetworkError, GoogleHttpError) as e:
+        return "error", f"Синхронизация не выполнена: {e}"
 
     errors = sync_schedule(service, calendar_id, exist_events, schedule, now)
     if errors:
-        return f"Готово с ошибками, не обработано пар: {len(errors)}"
-    return "Готово, расписание обновлено"
+        status = "partial"
+        message = f"Готово с ошибками, не обработано пар: {len(errors)}"
+        return status, message
+
+    status = "ok"
+    message = "Готово, расписание обновлено"
+    return status, message
 
 
 def methods_with_calendar(request):
@@ -130,7 +140,13 @@ def get_schedule(start, end, login, password):
     try:
         r = requests.post(login_url, headers=headers, files=files, timeout=15)
         r.raise_for_status()
+
     except requests.RequestException as e:
+        response = e.response
+        if response is not None and response.status_code == 401:
+            raise BadCredentials(
+                "Неверный логин или пароль от личного кабинета"
+            ) from e
         raise NetworkError(f"Не удалось войти на сайт: {e}") from e
     preview = check_json(r)
 
@@ -203,9 +219,9 @@ def parse_schedule(schedule):
                 "reminders": {
                     "useDefault": False,
                     "overrides": [
+                        {"method": "popup", "minutes": 5},
                         {"method": "popup", "minutes": 15},
                         {"method": "popup", "minutes": 30},
-                        {"method": "popup", "minutes": 60},
                     ]
                 },
 
@@ -253,7 +269,7 @@ def read_events(service, calendar_id, start, end):
             ) from e
         raise GoogleHttpError(f"Не удалось прочитать календарь: {e}") from e
     except RefreshError as e:
-        raise GoogleAuthError("не удалось войти в Google под аккаунтом бота") from e
+        raise GoogleHttpError("не удалось войти в Google под аккаунтом бота") from e
     except (TransportError,) + NETWORK_ERRORS as e:
         raise NetworkError(f"Нет связи с Google: {e}") from e
 
@@ -341,11 +357,12 @@ def get_window(now):
 
 
 def main():
-    print(run_sync(
+    status, message = run_sync(
         os.environ["RANEPA_LOGIN"],
         os.environ["RANEPA_PASSWORD"],
         os.environ["SCHEDULE_CALENDAR_ID"],
-    ))
+    )
+    print(message)
 
 
 if __name__ == "__main__":

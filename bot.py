@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import html
 
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -16,7 +17,7 @@ from first_try import run_sync
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO) 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ CONSENT, LOGIN, PASSWORD, CALENDAR = range(4)
 
 with open("secrets/service_account.json", encoding="utf-8") as f:
     ROBOT_EMAIL = json.load(f)["client_email"]
+
+ADMIN_ID = int(os.environ["ADMIN_ID"])
 
 text_only = filters.TEXT & ~filters.COMMAND
 
@@ -118,10 +121,19 @@ async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         password = db.get_password(user_id)
-        result = await asyncio.to_thread(
+        status, message = await asyncio.to_thread(
             run_sync, user["login"], password, user["calendar_id"]
         )
-        await update.message.reply_text(str(result))
+        error = None if status == "ok" else message
+        try:
+            await asyncio.to_thread(db.save_sync_result, user["telegram_id"], status, error)
+            if status == "user_error":
+                await asyncio.to_thread(db.mark_notified, user["telegram_id"])
+
+        except Exception:
+            logger.exception("Не записался результат синхронизации для %s", user_id)
+
+        await update.message.reply_text(str(message))
 
     except db.UserNotFound:
         await update.message.reply_text("Не нашёл твою запись. Пройди регистрацию: /start")
@@ -133,14 +145,62 @@ async def sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def notify_job(context: ContextTypes.DEFAULT_TYPE):
+    users = await asyncio.to_thread(db.get_users_to_notify)
+    for u in users:
+        text = u["last_error"]
+        try:
+            await context.bot.send_message(chat_id=u["telegram_id"], text=text)
+        except Exception:
+            logger.exception("Не отправилось пользователю %s", u["telegram_id"])
+            continue
+        await asyncio.to_thread(db.mark_notified, u["telegram_id"])
+
+
+async def admin_job(context: ContextTypes.DEFAULT_TYPE):
+    users = await asyncio.to_thread(db.get_users_for_admin)
+    if not users:
+        return
+
+    shown = users[:10]
+    icons = {"error": "🔴", "partial": "🟠", "user_error": "🟡"}
+
+    lines = [f"<b>Проблемы синхронизации: {len(users)}</b>"]
+    for u in shown:
+        error = html.escape((u["last_error"] or "—")[:150])
+        lines.append(
+            f"\n{icons.get(u['last_status'], '⚪')} <b>{u['last_status']}</b>\n"
+            f"id: <code>{u['telegram_id']}</code>\n"
+            f"ЛК: {html.escape(u['login'] or '—')}\n"
+            f"{error}"
+        )
+    if len(users) > len(shown):
+        lines.append(f"\nи ещё {len(users) - len(shown)}")
+    text = "\n".join(lines)
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID, text=text, parse_mode="HTML"
+        )
+    except Exception:
+        logger.exception("Не отправилась сводка админу")
+        return
+
+    ids = [u["telegram_id"] for u in shown]
+    await asyncio.to_thread(db.mark_admin_notified, ids)
+
+
 def main():
     db.init_db()
 
     app = Application.builder().token(os.environ["BOT_TOKEN"]).build()
     app.add_handler(conv)
     app.add_handler(CommandHandler("sync", sync))
+    app.job_queue.run_repeating(notify_job, interval=600, first=30)
+    app.job_queue.run_repeating(admin_job, interval=600, first=20)
 
     app.run_polling()
+
 
 
 if __name__ == "__main__":

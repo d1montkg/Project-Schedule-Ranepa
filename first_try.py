@@ -1,3 +1,5 @@
+import json
+import logging
 import time
 import datetime as dt
 import google_auth
@@ -13,6 +15,8 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
+log = logging.getLogger(__name__)
+
 headers = {
     "Accept": "application/json, text/plain, */*",
     "User-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
@@ -23,6 +27,7 @@ TOTALLY_TRIES = 2
 NETWORK_ERRORS = (OSError, httplib2.HttpLib2Error)
 CALENDAR_TITLE = "Расписание РАНХиГС"
 BATCH_SIZE = 50
+PAGE_SIZE = 250
 
 
 class SyncError(Exception):
@@ -111,6 +116,21 @@ def run_sync(login, password, google_token, calendar_id,
         )
 
     return "ok", "Готово, расписание обновлено", None
+
+
+def describe_error(e):
+    if isinstance(e, HttpError):
+        status = getattr(e.resp, "status", "?")
+        reason = ""
+        try:
+            err = json.loads(e.content.decode("utf-8")).get("error", {})
+            reason = (err.get("errors") or [{}])[0].get("reason", "")
+            message = err.get("message", "")
+        except Exception:
+            message = str(e)
+        return f"{status} {reason}: {message}"
+
+    return f"{type(e).__name__}: {e}"
 
 
 def methods_with_calendar(request):
@@ -231,6 +251,12 @@ def get_schedule(start, end, login, password):
     return schedule
 
 
+def prop(value):
+    if value is None:
+        return ""
+    return str(value)
+
+
 def parse_schedule(schedule, reminders_enabled, reminder_minutes):
     reminders_body = reminders.build_body(reminders_enabled, reminder_minutes)
     reminders_key = reminders.settings_key(reminders_enabled, reminder_minutes)
@@ -242,7 +268,7 @@ def parse_schedule(schedule, reminders_enabled, reminder_minutes):
 
             event_body = {
                 "summary": lesson["disc"],
-                "location": lesson["room"],
+                "location": lesson["room"] or "",
                 "description": f'{lesson["lecturer"]}, \n{lesson["type"]}',
 
                 "start": {
@@ -259,11 +285,11 @@ def parse_schedule(schedule, reminders_enabled, reminder_minutes):
 
                 "extendedProperties": {
                     "private": {
-                        "uid_disc": lesson["uid_disc"],
-                        "uid_status": lesson["uid_status"],
-                        "uid_room": lesson["uid_room"],
-                        "uid_type": lesson["uid_type"],
-                        "uid_lecturer": lesson["uid_lecturer"],
+                        "uid_disc": prop(lesson["uid_disc"]),
+                        "uid_status": prop(lesson["uid_status"]),
+                        "uid_room": prop(lesson["uid_room"]),
+                        "uid_type": prop(lesson["uid_type"]),
+                        "uid_lecturer": prop(lesson["uid_lecturer"]),
                         "reminders": reminders_key,
                     }
                 }
@@ -312,16 +338,25 @@ def ensure_calendar(refresh_token, calendar_id):
 def read_events(service, calendar_id, start, end):
     time_min_iso = start.isoformat()
     time_max_iso = end.isoformat()
+    items = []
+    page_token = None
 
     try:
-        events_result = service.events().list(
-            calendarId=calendar_id,
-            timeMin=time_min_iso,
-            timeMax=time_max_iso,
-            singleEvents=True,
-            orderBy="startTime",
-            timeZone="Europe/Moscow",
-        ).execute()
+        while True:
+            events_result = service.events().list(
+                calendarId=calendar_id,
+                timeMin=time_min_iso,
+                timeMax=time_max_iso,
+                singleEvents=True,
+                orderBy="startTime",
+                timeZone="Europe/Moscow",
+                maxResults=PAGE_SIZE,
+                pageToken=page_token,
+            ).execute()
+            items.extend(events_result.get("items", []))
+            page_token = events_result.get("nextPageToken")
+            if not page_token:
+                break
     except HttpError as e:
         if e.resp.status in (403, 404):
             raise CalendarUnavailable(
@@ -333,7 +368,7 @@ def read_events(service, calendar_id, start, end):
     except (TransportError,) + NETWORK_ERRORS as e:
         raise NetworkError(f"Нет связи с Google: {e}") from e
 
-    return events_result.get("items", [])
+    return items
 
 
 def make_callback(results, key):
@@ -359,8 +394,11 @@ def execute_jobs(service, jobs):
 
         for key, request in chunk:
             if results.get(key, True) is not None:
-                if methods_with_calendar(request) is not None:
-                    failed.append(key)
+                error = methods_with_calendar(request)
+                if error is not None:
+                    info = describe_error(error)
+                    log.error("Пара %s не обработана: %s", key, info)
+                    failed.append(f"{key}: {info}")
 
         if start + BATCH_SIZE < len(jobs):
             time.sleep(1)

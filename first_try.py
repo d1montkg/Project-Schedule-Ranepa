@@ -1,14 +1,13 @@
-import os
 import time
 import datetime as dt
-from zoneinfo import ZoneInfo
-
+import google_auth
 import httplib2
 import requests
+import reminders
+
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from google.auth.exceptions import RefreshError, TransportError
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
@@ -20,54 +19,98 @@ headers = {
 }
 
 moscow_tz = ZoneInfo("Europe/Moscow")
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
-SERVICE_ACCOUNT_PATH = "secrets/service_account.json"
 TOTALLY_TRIES = 2
 NETWORK_ERRORS = (OSError, httplib2.HttpLib2Error)
+CALENDAR_TITLE = "Расписание РАНХиГС"
+BATCH_SIZE = 50
 
 
-class ScheduleError(Exception):
-    pass
+class SyncError(Exception):
+    user_text = "Не удалось синхронизировать. Календарь не изменён."
+
+    def __init__(self, detail=""):
+        super().__init__(detail)
+        self.detail = detail
 
 
-class NetworkError(Exception):
-    pass
+class ScheduleError(SyncError):
+    user_text = (
+        "Сайт РАНХиГС сейчас не отдаёт расписание, возможно, просит пройти "
+        "проверку. Календарь не изменён, при следующей синхронизации попробую снова."
+    )
 
 
-class GoogleHttpError(Exception):
-    pass
+class NetworkError(SyncError):
+    user_text = (
+        "Не удалось связаться с сайтом или Google. Обычно это временно, "
+        "при следующей синхронизации попробую снова."
+    )
 
 
-class GoogleAuthError(Exception):
-    pass
+class GoogleHttpError(SyncError):
+    user_text = (
+        "Сбой на стороне бота или Google. Календарь не изменён, "
+        "я уже знаю о проблеме."
+    )
 
 
-class BadCredentials(Exception):
-    pass
+class GoogleAuthError(SyncError):
+    user_text = "Не удалось войти в Google. Подключи заново: /start"
 
 
-def run_sync(login, password, calendar_id):
+class GoogleAccessRevoked(GoogleAuthError):
+    user_text = "Доступ к Google отозван или истёк. Подключи заново: /start"
+
+
+class CalendarUnavailable(GoogleAuthError):
+    user_text = "Календарь недоступен, возможно, он удалён. Подключи заново: /start"
+
+
+class BadCredentials(SyncError):
+    user_text = "Неверный логин или пароль от ЛК. Пришли их заново: /start"
+
+
+def run_sync(login, password, google_token, calendar_id,
+             reminders_enabled, reminder_minutes):
+    if not google_token or not calendar_id:
+        return (
+            "user_error",
+            "Нужно заново подключить Google Calendar: пройди /start",
+            "нет google_token или calendar_id",
+        )
+
     now = dt.datetime.now(tz=moscow_tz)
     start, end = get_window(now)
 
     try:
         schedule = get_schedule(start, end, login, password)
-        service = get_calendar_service()
+        service = google_auth.build_calendar_service(google_token)
         exist_events = read_events(service, calendar_id, start, end)
     except (BadCredentials, GoogleAuthError) as e:
-        return "user_error", f"Синхронизация не выполнена: {e}"
+        return (
+            "user_error",
+            f"Синхронизация не выполнена. {e.user_text}",
+            f"{type(e).__name__}: {e.detail}",
+        )
     except (ScheduleError, NetworkError, GoogleHttpError) as e:
-        return "error", f"Синхронизация не выполнена: {e}"
+        return (
+            "error",
+            f"Синхронизация не выполнена. {e.user_text}",
+            f"{type(e).__name__}: {e.detail}",
+        )
 
-    errors = sync_schedule(service, calendar_id, exist_events, schedule, now)
+    errors = sync_schedule(
+        service, calendar_id, exist_events, schedule, now,
+        reminders_enabled, reminder_minutes,
+    )
     if errors:
-        status = "partial"
-        message = f"Готово с ошибками, не обработано пар: {len(errors)}"
-        return status, message
+        return (
+            "partial",
+            f"Готово с ошибками, не обработано пар: {len(errors)}",
+            f"не обработано: {errors[:5]}",
+        )
 
-    status = "ok"
-    message = "Готово, расписание обновлено"
-    return status, message
+    return "ok", "Готово, расписание обновлено", None
 
 
 def methods_with_calendar(request):
@@ -94,11 +137,7 @@ def methods_with_calendar(request):
 def check_json(r):
     content_type = r.headers.get("Content-Type", "")
     if "json" not in content_type:
-        print(f"сайт вернул не JSON: {content_type}")
-        raise ScheduleError(
-            "сайт РАНХиГС сейчас просит пройти проверку и не отдаёт расписание. "
-            "Календарь не изменён, попробуйте позже"
-        )
+        raise ScheduleError(f"ответ не JSON, Content-Type: {content_type}")
 
     return r.json()
 
@@ -144,9 +183,7 @@ def get_schedule(start, end, login, password):
     except requests.RequestException as e:
         response = e.response
         if response is not None and response.status_code == 401:
-            raise BadCredentials(
-                "Неверный логин или пароль от личного кабинета"
-            ) from e
+            raise BadCredentials("401 при входе в ЛК") from e
         raise NetworkError(f"Не удалось войти на сайт: {e}") from e
     preview = check_json(r)
 
@@ -194,7 +231,9 @@ def get_schedule(start, end, login, password):
     return schedule
 
 
-def parse_schedule(schedule):
+def parse_schedule(schedule, reminders_enabled, reminder_minutes):
+    reminders_body = reminders.build_body(reminders_enabled, reminder_minutes)
+    reminders_key = reminders.settings_key(reminders_enabled, reminder_minutes)
     events = []
     for certain_day in schedule["days"]:
         for lesson in certain_day["discs"]:
@@ -216,14 +255,7 @@ def parse_schedule(schedule):
                     "timeZone": "Europe/Moscow"
                 },
 
-                "reminders": {
-                    "useDefault": False,
-                    "overrides": [
-                        {"method": "popup", "minutes": 5},
-                        {"method": "popup", "minutes": 15},
-                        {"method": "popup", "minutes": 30},
-                    ]
-                },
+                "reminders": reminders_body,
 
                 "extendedProperties": {
                     "private": {
@@ -232,6 +264,7 @@ def parse_schedule(schedule):
                         "uid_room": lesson["uid_room"],
                         "uid_type": lesson["uid_type"],
                         "uid_lecturer": lesson["uid_lecturer"],
+                        "reminders": reminders_key,
                     }
                 }
             }
@@ -241,11 +274,39 @@ def parse_schedule(schedule):
     return events
 
 
-def get_calendar_service():
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_PATH, scopes=SCOPES
-    )
-    return build("calendar", "v3", credentials=creds)
+def convert_refresh_error(e):
+    details = e.args[1] if len(e.args) > 1 and isinstance(e.args[1], dict) else {}
+    if details.get("error") == "invalid_grant":
+        return GoogleAccessRevoked("invalid_grant")
+    return GoogleHttpError(f"RefreshError: {details.get('error', 'unknown')}")
+
+
+def calendar_exists(service, calendar_id):
+    try:
+        service.calendars().get(calendarId=calendar_id).execute()
+    except HttpError as e:
+        if e.resp.status in (403, 404):
+            return False
+        raise
+    return True
+
+
+def ensure_calendar(refresh_token, calendar_id):
+    service = google_auth.build_calendar_service(refresh_token)
+    try:
+        if calendar_id and calendar_exists(service, calendar_id):
+            return calendar_id
+        created = service.calendars().insert(
+            body={"summary": CALENDAR_TITLE, "timeZone": "Europe/Moscow"}
+        ).execute()
+    except RefreshError as e:
+        raise convert_refresh_error(e) from e
+    except HttpError as e:
+        raise GoogleHttpError(f"Не удалось создать календарь: {e}") from e
+    except (TransportError,) + NETWORK_ERRORS as e:
+        raise NetworkError(f"Нет связи с Google: {e}") from e
+
+    return created["id"]
 
 
 def read_events(service, calendar_id, start, end):
@@ -263,78 +324,96 @@ def read_events(service, calendar_id, start, end):
         ).execute()
     except HttpError as e:
         if e.resp.status in (403, 404):
-            raise GoogleAuthError(
-                "нет доступа к календарю: проверь ID и то, что ты дал доступ "
-                "адресу бота с правом изменять мероприятия"
+            raise CalendarUnavailable(
+                f"HTTP {e.resp.status} при чтении календаря"
             ) from e
         raise GoogleHttpError(f"Не удалось прочитать календарь: {e}") from e
     except RefreshError as e:
-        raise GoogleHttpError("не удалось войти в Google под аккаунтом бота") from e
+        raise convert_refresh_error(e) from e
     except (TransportError,) + NETWORK_ERRORS as e:
         raise NetworkError(f"Нет связи с Google: {e}") from e
 
     return events_result.get("items", [])
 
 
-def create_events(service, calendar_id, event_body):
-    request = service.events().insert(
-        calendarId=calendar_id,
-        body=event_body
-    )
-    return methods_with_calendar(request)
+def make_callback(results, key):
+    def callback(request_id, response, exception):
+        results[key] = exception
+    return callback
 
 
-def sync_schedule(service, calendar_id, exist_events, schedule, now):
+def execute_jobs(service, jobs):
+    failed = []
+    for start in range(0, len(jobs), BATCH_SIZE):
+        chunk = jobs[start:start + BATCH_SIZE]
+        results = {}
+
+        batch = service.new_batch_http_request()
+        for key, request in chunk:
+            batch.add(request, callback=make_callback(results, key))
+
+        try:
+            batch.execute()
+        except (HttpError,) + NETWORK_ERRORS:
+            pass
+
+        for key, request in chunk:
+            if results.get(key, True) is not None:
+                if methods_with_calendar(request) is not None:
+                    failed.append(key)
+
+        if start + BATCH_SIZE < len(jobs):
+            time.sleep(1)
+
+    return failed
+
+
+def sync_schedule(service, calendar_id, exist_events, schedule, now,
+                  reminders_enabled, reminder_minutes):
     events_in_calendar = {}
     for event in exist_events:
-        key = get_event_key(event)
-        events_in_calendar[key] = event
+        events_in_calendar[get_event_key(event)] = event
 
-    events = parse_schedule(schedule)
-    errors_events = []
+    events = parse_schedule(schedule, reminders_enabled, reminder_minutes)
+    jobs = []
     schedule_keys = set()
     for event in events:
-        check_event = get_event_key(event)
-        schedule_keys.add(check_event)
+        key = get_event_key(event)
+        schedule_keys.add(key)
 
-        if check_event not in events_in_calendar:
-            if create_events(service, calendar_id, event) is not None:
-                errors_events.append(check_event)
+        if key not in events_in_calendar:
+            jobs.append((key, service.events().insert(
+                calendarId=calendar_id, body=event
+            )))
+            continue
 
-        else:  # событие уже есть в календаре: проверяем, не изменилось ли оно
-            private_par = events_in_calendar[check_event]["extendedProperties"]["private"]
-            event_par = event["extendedProperties"]["private"]
+        if dt.datetime.fromisoformat(event["start"]["dateTime"]) <= now:
+            continue
 
-            if (
-                private_par["uid_status"] == event_par["uid_status"]
-                and private_par["uid_room"] == event_par["uid_room"]
-                and private_par["uid_type"] == event_par["uid_type"]
-                and private_par["uid_lecturer"] == event_par["uid_lecturer"]
-            ):
-                pass
+        current = events_in_calendar[key]
+        private_par = current["extendedProperties"]["private"]
+        event_par = event["extendedProperties"]["private"]
+        if (
+            private_par["uid_status"] == event_par["uid_status"]
+            and private_par["uid_room"] == event_par["uid_room"]
+            and private_par["uid_type"] == event_par["uid_type"]
+            and private_par["uid_lecturer"] == event_par["uid_lecturer"]
+            and private_par.get("reminders") == event_par["reminders"]
+        ):
+            continue
 
-            else:  # поменялась аудитория, преподаватель или тип
-                eventId = events_in_calendar[check_event]["id"]
-                request = service.events().patch(
-                    calendarId=calendar_id,
-                    eventId=eventId,
-                    body=event
-                )
-                if methods_with_calendar(request) is not None:
-                    errors_events.append(check_event)
+        jobs.append((key, service.events().patch(
+            calendarId=calendar_id, eventId=current["id"], body=event
+        )))
 
     for key, event in events_in_calendar.items():
         event_start = dt.datetime.fromisoformat(event["start"]["dateTime"])
         if key not in schedule_keys and event_start > now:
-            eventId = event["id"]
-            request = service.events().delete(
-                calendarId=calendar_id,
-                eventId=eventId
-            )
-            if methods_with_calendar(request) is not None:
-                errors_events.append(key)
+            jobs.append((key, service.events().delete(
+                calendarId=calendar_id, eventId=event["id"]
+            )))
 
-    return errors_events
+    return execute_jobs(service, jobs)
 
 
 def get_event_key(event):
@@ -354,16 +433,3 @@ def get_window(now):
     )
     end = start + dt.timedelta(28)
     return (start, end)
-
-
-def main():
-    status, message = run_sync(
-        os.environ["RANEPA_LOGIN"],
-        os.environ["RANEPA_PASSWORD"],
-        os.environ["SCHEDULE_CALENDAR_ID"],
-    )
-    print(message)
-
-
-if __name__ == "__main__":
-    main()

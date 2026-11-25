@@ -5,6 +5,7 @@ import time
 import db
 import crypto
 import first_try as ft
+import reminders
 
 from pathlib import Path
 
@@ -49,15 +50,24 @@ def main():
     for user in db.get_all_users():
         try:
             password = crypto.decrypt(user["password"])
-            status, message = ft.run_sync(user["login"], password, user["calendar_id"])
+            enabled, minutes = reminders.user_settings(user)
+            status, message, detail = ft.run_sync(
+                user["login"], password, db.decrypt_google_token(user),
+                user["calendar_id"], enabled, minutes,
+            )
 
             error = None if status == "ok" else message
-            log.info("user %s: %s", user["telegram_id"], message)
-            db.save_sync_result(user["telegram_id"], status, error)
+            log.info("user %s: %s | %s", user["telegram_id"], message, detail)
+            db.save_sync_result(user["telegram_id"], status, error, detail)
 
         except Exception as e:
             log.exception("Сбой у пользователя %s", user["telegram_id"])
-            db.save_sync_result(user["telegram_id"], "error", type(e).__name__ )
+            db.save_sync_result(
+                user["telegram_id"],
+                "error",
+                "Синхронизация не выполнена. Сбой на стороне бота, я уже знаю о проблеме.",
+                type(e).__name__,
+            )
     
 
 if __name__ == "__main__":

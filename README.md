@@ -26,7 +26,7 @@ Telegram-бот, который переносит расписание из л�
 Нужен Python 3.14 (проверено на нём) и Windows.
 
 ```bash
-git clone https://github.com/<your-username>/Project-Schedule-Ranepa.git
+git clone https://github.com/d1montkg/Project-Schedule-Ranepa.git
 cd Project-Schedule-Ranepa
 python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt

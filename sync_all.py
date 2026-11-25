@@ -71,4 +71,10 @@ def main():
     
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        log.exception("sync_all упал до обработки пользователей")
+        raise

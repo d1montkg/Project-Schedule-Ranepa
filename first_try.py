@@ -1,25 +1,21 @@
-import os
-import requests
 import json
+import logging
+import time
 import datetime as dt
+import google_auth
+import httplib2
+import requests
+import reminders
+
 from zoneinfo import ZoneInfo
-
-from google.oauth2.credentials import Credentials # токен для запросов
-from google_auth_oauthlib.flow import InstalledAppFlow # OAuth2 для авторизации через браузер
-from google.auth.transport.requests import Request # для обновления истекшего токена
-from googleapiclient.discovery import build # создание объекта service для работы с гугл календарем
-from googleapiclient.errors import HttpError # для обработки ошибок http
-from google.auth.exceptions import RefreshError
-
 from dotenv import load_dotenv
+from google.auth.exceptions import RefreshError, TransportError
+from googleapiclient.errors import HttpError
 
 
 load_dotenv()
-files = {
-    "login": (None, os.environ["RANEPA_LOGIN"]),
-    "password": (None, os.environ["RANEPA_PASSWORD"]),
-    "remember_me": (None, True)
-}
+
+log = logging.getLogger(__name__)
 
 headers = {
     "Accept": "application/json, text/plain, */*",
@@ -27,18 +23,198 @@ headers = {
 }
 
 moscow_tz = ZoneInfo("Europe/Moscow")
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
-SCHEDULE_CALENDAR_ID = os.environ["SCHEDULE_CALENDAR_ID"]
-SCHEDULE_PATH = "data/schedule.json"
-TOKEN_PATH = "secrets/token.json"
-CREDENTIALS_PATH = "secrets/credentials.json"
+TOTALLY_TRIES = 2
+NETWORK_ERRORS = (OSError, httplib2.HttpLib2Error)
+CALENDAR_TITLE = "Расписание РАНХиГС"
+BATCH_SIZE = 50
+PAGE_SIZE = 250
 
-def get_schedule(start, end):
+
+class SyncError(Exception):
+    user_text = "Не удалось синхронизировать. Календарь не изменён."
+
+    def __init__(self, detail=""):
+        super().__init__(detail)
+        self.detail = detail
+
+
+class ScheduleError(SyncError):
+    user_text = (
+        "Сайт РАНХиГС сейчас не отдаёт расписание, возможно, просит пройти "
+        "проверку. Календарь не изменён, при следующей синхронизации попробую снова."
+    )
+
+
+class NetworkError(SyncError):
+    user_text = (
+        "Не удалось связаться с сайтом или Google. Обычно это временно, "
+        "при следующей синхронизации попробую снова."
+    )
+
+
+class GoogleHttpError(SyncError):
+    user_text = (
+        "Сбой на стороне бота или Google. Календарь не изменён, "
+        "я уже знаю о проблеме."
+    )
+
+
+class GoogleAuthError(SyncError):
+    user_text = "Не удалось войти в Google. Подключи заново: /start"
+
+
+class GoogleAccessRevoked(GoogleAuthError):
+    user_text = "Доступ к Google отозван или истёк. Подключи заново: /start"
+
+
+class CalendarUnavailable(GoogleAuthError):
+    user_text = "Календарь недоступен, возможно, он удалён. Подключи заново: /start"
+
+
+class BadCredentials(SyncError):
+    user_text = "Неверный логин или пароль от ЛК. Пришли их заново: /start"
+
+
+def run_sync(login, password, google_token, calendar_id,
+             reminders_enabled, reminder_minutes):
+    if not google_token or not calendar_id:
+        return (
+            "user_error",
+            "Нужно заново подключить Google Calendar: пройди /start",
+            "нет google_token или calendar_id",
+        )
+
+    now = dt.datetime.now(tz=moscow_tz)
+    start, end = get_window(now)
+
+    try:
+        schedule = get_schedule(start, end, login, password)
+        service = google_auth.build_calendar_service(google_token)
+        exist_events = read_events(service, calendar_id, start, end)
+    except (BadCredentials, GoogleAuthError) as e:
+        return (
+            "user_error",
+            f"Синхронизация не выполнена. {e.user_text}",
+            f"{type(e).__name__}: {e.detail}",
+        )
+    except (ScheduleError, NetworkError, GoogleHttpError) as e:
+        return (
+            "error",
+            f"Синхронизация не выполнена. {e.user_text}",
+            f"{type(e).__name__}: {e.detail}",
+        )
+
+    errors = sync_schedule(
+        service, calendar_id, exist_events, schedule, now,
+        reminders_enabled, reminder_minutes,
+    )
+    if errors:
+        return (
+            "partial",
+            f"Готово с ошибками, не обработано пар: {len(errors)}",
+            f"не обработано: {errors[:5]}",
+        )
+
+    return "ok", "Готово, расписание обновлено", None
+
+
+def describe_error(e):
+    if isinstance(e, HttpError):
+        status = getattr(e.resp, "status", "?")
+        reason = ""
+        try:
+            err = json.loads(e.content.decode("utf-8")).get("error", {})
+            reason = (err.get("errors") or [{}])[0].get("reason", "")
+            message = err.get("message", "")
+        except Exception:
+            message = str(e)
+        return f"{status} {reason}: {message}"
+
+    return f"{type(e).__name__}: {e}"
+
+
+def methods_with_calendar(request):
+    for attempt in range(TOTALLY_TRIES + 1):
+        is_last = attempt == TOTALLY_TRIES
+        try:
+            request.execute()
+            return None
+
+        except HttpError as e:
+            is_temporary = e.resp.status in (500, 503, 429)
+            error = e
+
+        except NETWORK_ERRORS as e:
+            is_temporary = True
+            error = e
+
+        if is_temporary and not is_last:
+            time.sleep(3)
+        else:
+            return error
+
+
+def check_json(r):
+    content_type = r.headers.get("Content-Type", "")
+    if "json" not in content_type:
+        raise ScheduleError(f"ответ не JSON, Content-Type: {content_type}")
+
+    return r.json()
+
+
+def get_group_filters(headers_token):
+    groups_url = "https://my.ranepa.ru/lk/n-api/manual/student-groups"
+    try:
+        r = requests.get(groups_url, headers=headers_token, timeout=15)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise NetworkError(f"Не удалось получить список групп: {e}") from e
+
+    data = check_json(r)
+
+    items = data.get("items")
+    if not items:
+        raise ScheduleError("Сайт не вернул ни одного студента для этого аккаунта")
+    
+    group = items[0]
+    uids = [g["uid_edu_group"] for g in group.get("edu_group", []) if g.get("uid_edu_group")]
+    if not uids:
+        raise ScheduleError("У студента нет учебных групп, расписание не построить")
+
+    uid_org = group.get("uid_org")
+    if not uid_org:
+        raise ScheduleError("В ответе нет uid_org")
+    
+    return (uids, uid_org)
+
+
+def get_schedule(start, end, login, password):
     login_url = "https://my.ranepa.ru/lk/n-api/auth/login"
-    r = requests.post(login_url, headers=headers, files=files)
-    preview = r.json()
-    access_token = preview["access_token"]
+    files = {
+        "login": (None, login),
+        "password": (None, password),
+        "remember_me": (None, True),
+    }
 
+    try:
+        r = requests.post(login_url, headers=headers, files=files, timeout=15)
+        r.raise_for_status()
+
+    except requests.RequestException as e:
+        response = e.response
+        if response is not None and response.status_code == 401:
+            raise BadCredentials("401 при входе в ЛК") from e
+        raise NetworkError(f"Не удалось войти на сайт: {e}") from e
+    preview = check_json(r)
+
+    url = "https://my.ranepa.ru/lk/n-api/schedule"
+    access_token = preview["access_token"]
+    headers_token = {
+        "Authorization": "Bearer " + access_token,
+        "Accept": "application/json, text/plain, */*",
+        "User-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+        "Version": "1.7"
+    }
     
     date_list = []
     day = start
@@ -47,226 +223,251 @@ def get_schedule(start, end):
         date_list.append(f"{current_day}T00:00:00.000")
         day += dt.timedelta(days=1)
 
-
-    url = "https://my.ranepa.ru/lk/n-api/schedule?uid_org=7923e704-99aa-11e5-bed4-c48508aa74e4&type=group&filter[]=398d38b8-1b98-11f0-9f95-00620bc81861&filter[]=8957051a-1b99-11f0-9f95-00620bc81861&filter[]=971e9ee3-1f81-11f0-9f96-00620bc81861&filter[]=606e8975-1f82-11f0-9f96-00620bc81861&filter[]=8dfd5228-1f82-11f0-9f96-00620bc81861&filter[]=2526ca7c-9ae1-11f0-9fa0-00620bc81861&filter[]=79fea6eb-b56d-11f0-9fa2-00620bc81861&filter[]=1c55dbe9-b718-11f0-9fa2-00620bc81861&filter[]=6bfce9e7-b718-11f0-9fa2-00620bc81861&filter[]=252931bd-c5f7-11f0-9fa2-00620bc81861&filter[]=50d92106-cecd-11f0-9fa2-00620bc81861&filter[]=7368ed65-d4e4-11f0-9fa3-00620bc81861&filter[]=031dbd30-d4f8-11f0-9fa3-00620bc81861&filter[]=041383ac-34e6-11f1-9fab-00620bc81861&filter[]=9542dc2c-3fd7-11f1-9fab-00620bc81861&filter[]=d8a7d792-5828-11f1-9fac-00620bc81861&filter[]=d8a7d7ab-5828-11f1-9fac-00620bc81861&filter[]=d8a7d7d7-5828-11f1-9fac-00620bc81861&filter[]=c57342e5-7e3c-11f1-9fac-00620bc81861&filter[]=2b0e6a5a-7f99-11f1-9fac-00620bc81861&filter[]=2b0e6ab5-7f99-11f1-9fac-00620bc81861&filter[]=aa496774-817b-11f1-9fac-00620bc81861&filter[]=aa496776-817b-11f1-9fac-00620bc81861&filter[]=d3eae5db-912f-11f1-9fac-00620bc81861&filter[]=9015f5ba-9a40-11f1-9faf-00620bc81861"
-    headers_token = {
-        "Authorization": "Bearer " + access_token,
-        "Accept": "application/json, text/plain, */*",
-        "User-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
-        "Version": "1.7"
-    }
+    filters, uid_org = get_group_filters(headers_token)
 
     params = {
+        "uid_org": uid_org,
+        "type": "group",
         "dates[]": date_list,
+        "filter[]": filters,
         "branch_type": "main"
     }
 
-    # получаем schedule.json
-    r = requests.get(url, headers=headers_token, params=params)
-    schedule = r.json()
-    with open(SCHEDULE_PATH, "w", encoding="utf8") as file:
-        json.dump(schedule, file, indent=4, ensure_ascii=False)
+    try:
+        r = requests.get(url, headers=headers_token, params=params, timeout=30)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise NetworkError(f"Не удалось получить расписание: {e}") from e
 
-    with open(SCHEDULE_PATH, encoding="utf8") as file:
-        schedule = json.load(file)
+    schedule = check_json(r)
 
-def parse_schedule_for_month(): # возвращает список событий events
-    with open(SCHEDULE_PATH, encoding="utf8") as file:
-        schedule = json.load(file)
+    if "days" not in schedule:
+        raise ScheduleError("В расписании нет поля days")
 
-        events = []
-        all_days = schedule["days"]
-        for certain_day in all_days:
-            schedule_certain_day = certain_day["discs"]
+    lessons_count = sum(len(d.get("discs", [])) for d in schedule["days"])
+    if lessons_count == 0:
+        raise ScheduleError("Расписание пришло пустым")
 
-            for lesson in schedule_certain_day:
-                start_time = make_time(lesson["start_date"])
-                end_time = make_time(lesson["end_date"])
+    return schedule
 
-                event_body = {
-                    "summary": lesson["disc"],
-                    "location": lesson["room"],
-                    "description": f'{lesson["lecturer"]}, \n{lesson["type"]}',
 
-                    "start": {
-                        "dateTime": start_time.isoformat(),
-                        "timeZone": "Europe/Moscow"
-                    },
+def prop(value):
+    if value is None:
+        return ""
+    return str(value)
 
-                    "end": {
-                        "dateTime": end_time.isoformat(),
-                        "timeZone": "Europe/Moscow"
-                    },
 
-                    "reminders": {
-                        "useDefault": False,
-                        "overrides": [
-                            {"method": "popup", "minutes": 15},
-                            {"method": "popup", "minutes": 30},
-                            {"method": "popup", "minutes": 60},
-                        ]
-                    },
+def parse_schedule(schedule, reminders_enabled, reminder_minutes):
+    reminders_body = reminders.build_body(reminders_enabled, reminder_minutes)
+    reminders_key = reminders.settings_key(reminders_enabled, reminder_minutes)
+    events = []
+    for certain_day in schedule["days"]:
+        for lesson in certain_day["discs"]:
+            start_time = make_time(lesson["start_date"])
+            end_time = make_time(lesson["end_date"])
 
-                    "extendedProperties":{
-                        "private": {
-                            "uid_disc": lesson["uid_disc"],
-                            "uid_status": lesson["uid_status"],
-                            "uid_room": lesson["uid_room"],
-                            "uid_type": lesson["uid_type"],
-                            "uid_lecturer": lesson["uid_lecturer"],
-                        }
+            event_body = {
+                "summary": lesson["disc"],
+                "location": lesson["room"] or "",
+                "description": f'{lesson["lecturer"]}, \n{lesson["type"]}',
+
+                "start": {
+                    "dateTime": start_time.isoformat(),
+                    "timeZone": "Europe/Moscow"
+                },
+
+                "end": {
+                    "dateTime": end_time.isoformat(),
+                    "timeZone": "Europe/Moscow"
+                },
+
+                "reminders": reminders_body,
+
+                "extendedProperties": {
+                    "private": {
+                        "uid_disc": prop(lesson["uid_disc"]),
+                        "uid_status": prop(lesson["uid_status"]),
+                        "uid_room": prop(lesson["uid_room"]),
+                        "uid_type": prop(lesson["uid_type"]),
+                        "uid_lecturer": prop(lesson["uid_lecturer"]),
+                        "reminders": reminders_key,
                     }
                 }
+            }
 
-                events.append(event_body)
-
-        return events
-
-def get_calendar_service(): #доступ к календарю, объект service
-    creds = None
-    token_path = TOKEN_PATH
-    credentials_path = CREDENTIALS_PATH
-
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-
-    if creds and creds.valid:
-        pass
-
-    else:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except RefreshError:
-                creds = None
-        else:
-            creds = None
-
-        if creds is None:
-            flow = InstalledAppFlow.from_client_secrets_file(credentials_path, SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        with open(token_path, "w") as token:
-            token.write(creds.to_json())
-
-    service = build("calendar", "v3", credentials=creds)
-    return service
-
-def read_events(service, start, end):
-    time_min_iso = start.isoformat()
-    time_max_iso = end.isoformat()
-
-    events_result = service.events().list(
-        calendarId=SCHEDULE_CALENDAR_ID,
-        timeMin=time_min_iso,
-        timeMax=time_max_iso,
-        singleEvents=True,
-        orderBy="startTime",
-        timeZone="Europe/Moscow",
-    ).execute()
-    
-    events = events_result.get("items", [])
+            events.append(event_body)
 
     return events
-        
-def create_events(service, event_body):
+
+
+def convert_refresh_error(e):
+    details = e.args[1] if len(e.args) > 1 and isinstance(e.args[1], dict) else {}
+    if details.get("error") == "invalid_grant":
+        return GoogleAccessRevoked("invalid_grant")
+    return GoogleHttpError(f"RefreshError: {details.get('error', 'unknown')}")
+
+
+def calendar_exists(service, calendar_id):
     try:
-        service.events().insert(
-            calendarId=SCHEDULE_CALENDAR_ID,
-            body=event_body
+        service.calendars().get(calendarId=calendar_id).execute()
+    except HttpError as e:
+        if e.resp.status in (403, 404):
+            return False
+        raise
+    return True
+
+
+def ensure_calendar(refresh_token, calendar_id):
+    service = google_auth.build_calendar_service(refresh_token)
+    try:
+        if calendar_id and calendar_exists(service, calendar_id):
+            return calendar_id
+        created = service.calendars().insert(
+            body={"summary": CALENDAR_TITLE, "timeZone": "Europe/Moscow"}
         ).execute()
+    except RefreshError as e:
+        raise convert_refresh_error(e) from e
+    except HttpError as e:
+        raise GoogleHttpError(f"Не удалось создать календарь: {e}") from e
+    except (TransportError,) + NETWORK_ERRORS as e:
+        raise NetworkError(f"Нет связи с Google: {e}") from e
 
-    except HttpError as error:
-        return error
+    return created["id"]
 
-def sync_schedule(service, exist_events, now):
+
+def read_events(service, calendar_id, start, end):
+    time_min_iso = start.isoformat()
+    time_max_iso = end.isoformat()
+    items = []
+    page_token = None
+
+    try:
+        while True:
+            events_result = service.events().list(
+                calendarId=calendar_id,
+                timeMin=time_min_iso,
+                timeMax=time_max_iso,
+                singleEvents=True,
+                orderBy="startTime",
+                timeZone="Europe/Moscow",
+                maxResults=PAGE_SIZE,
+                pageToken=page_token,
+            ).execute()
+            items.extend(events_result.get("items", []))
+            page_token = events_result.get("nextPageToken")
+            if not page_token:
+                break
+    except HttpError as e:
+        if e.resp.status in (403, 404):
+            raise CalendarUnavailable(
+                f"HTTP {e.resp.status} при чтении календаря"
+            ) from e
+        raise GoogleHttpError(f"Не удалось прочитать календарь: {e}") from e
+    except RefreshError as e:
+        raise convert_refresh_error(e) from e
+    except (TransportError,) + NETWORK_ERRORS as e:
+        raise NetworkError(f"Нет связи с Google: {e}") from e
+
+    return items
+
+
+def make_callback(results, key):
+    def callback(request_id, response, exception):
+        results[key] = exception
+    return callback
+
+
+def execute_jobs(service, jobs):
+    failed = []
+    for start in range(0, len(jobs), BATCH_SIZE):
+        chunk = jobs[start:start + BATCH_SIZE]
+        results = {}
+
+        batch = service.new_batch_http_request()
+        for key, request in chunk:
+            batch.add(request, callback=make_callback(results, key))
+
+        try:
+            batch.execute()
+        except (HttpError,) + NETWORK_ERRORS:
+            pass
+
+        for key, request in chunk:
+            if results.get(key, True) is not None:
+                error = methods_with_calendar(request)
+                if error is not None:
+                    info = describe_error(error)
+                    log.error("Пара %s не обработана: %s", key, info)
+                    failed.append(f"{key}: {info}")
+
+        if start + BATCH_SIZE < len(jobs):
+            time.sleep(1)
+
+    return failed
+
+
+def sync_schedule(service, calendar_id, exist_events, schedule, now,
+                  reminders_enabled, reminder_minutes):
     events_in_calendar = {}
     for event in exist_events:
-        key = get_event_key(event)
-        events_in_calendar[key] = event
+        events_in_calendar[get_event_key(event)] = event
 
-
-    events = parse_schedule_for_month()
-    errors_events = []
+    events = parse_schedule(schedule, reminders_enabled, reminder_minutes)
+    jobs = []
     schedule_keys = set()
     for event in events:
-        check_event = get_event_key(event)
-        schedule_keys.add(check_event)
+        key = get_event_key(event)
+        schedule_keys.add(key)
 
-        if check_event not in events_in_calendar:
-            if create_events(service, event) is not None:
-                errors_events.append(check_event)
+        if key not in events_in_calendar:
+            jobs.append((key, service.events().insert(
+                calendarId=calendar_id, body=event
+            )))
+            continue
 
-        else: # если событие есть в календаре, но ничего не изменилось
-            private_par = events_in_calendar[check_event]["extendedProperties"]["private"]
-            event_par = event["extendedProperties"]["private"]
-            
-            uid_status_e = private_par["uid_status"]
-            uid_room_e = private_par["uid_room"]
-            uid_type_e = private_par["uid_type"]
-            uid_lecturer_e = private_par["uid_lecturer"]
-            
-            uid_status = event_par["uid_status"]
-            uid_room = event_par["uid_room"]
-            uid_type = event_par["uid_type"]
-            uid_lecturer = event_par["uid_lecturer"]
+        if dt.datetime.fromisoformat(event["start"]["dateTime"]) <= now:
+            continue
 
-            if (
-                uid_status_e == uid_status
-                and uid_room_e == uid_room
-                and uid_type_e == uid_type
-                and uid_lecturer_e == uid_lecturer
-            ):
-                pass
+        current = events_in_calendar[key]
+        private_par = current["extendedProperties"]["private"]
+        event_par = event["extendedProperties"]["private"]
+        if (
+            private_par["uid_status"] == event_par["uid_status"]
+            and private_par["uid_room"] == event_par["uid_room"]
+            and private_par["uid_type"] == event_par["uid_type"]
+            and private_par["uid_lecturer"] == event_par["uid_lecturer"]
+            and private_par.get("reminders") == event_par["reminders"]
+        ):
+            continue
 
-            else: # если поменялась аудитория, преподаватель или тп
-                try:
-                    eventId = events_in_calendar[check_event]["id"]
-                    service.events().patch(
-                        calendarId=SCHEDULE_CALENDAR_ID,
-                        eventId=eventId,
-                        body=event
-                    ).execute()
-                except HttpError:
-                    errors_events.append(check_event)
+        jobs.append((key, service.events().patch(
+            calendarId=calendar_id, eventId=current["id"], body=event
+        )))
 
     for key, event in events_in_calendar.items():
-        try:
-            event_start = dt.datetime.fromisoformat(event["start"]["dateTime"])
-            if key not in schedule_keys and event_start > now:
-                eventId = event["id"]
-                service.events().delete(
-                    calendarId=SCHEDULE_CALENDAR_ID,
-                    eventId=eventId
-                ).execute()
-        except HttpError:
-            errors_events.append(key)
+        event_start = dt.datetime.fromisoformat(event["start"]["dateTime"])
+        if key not in schedule_keys and event_start > now:
+            jobs.append((key, service.events().delete(
+                calendarId=calendar_id, eventId=event["id"]
+            )))
 
-    return errors_events
-        
+    return execute_jobs(service, jobs)
+
+
 def get_event_key(event):
     start = event["start"]["dateTime"]
     uid_disc = event["extendedProperties"]["private"]["uid_disc"]
 
     return f"{start}_{uid_disc}"
 
+
 def make_time(date):
-    date = dt.datetime.fromisoformat(date).replace(tzinfo=moscow_tz)
-    return date
+    return dt.datetime.fromisoformat(date).replace(tzinfo=moscow_tz)
+
 
 def get_window(now):
-    start = (now - dt.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = (now - dt.timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     end = start + dt.timedelta(28)
     return (start, end)
-
-def main():
-    now = dt.datetime.now(tz=moscow_tz)
-    start, end = get_window(now)
-    get_schedule(start, end) # получаем расписание в виде файла schedule.json
-    service = get_calendar_service() # получаем для взаимодействия между python и Google Calendar API
-    exist_events = read_events(service, start, end) # получаем уже существующие мероприятия
-    errors = sync_schedule(service, exist_events, now)
-    print(errors)
-    
-if __name__ == "__main__":
-    main()
